@@ -1,0 +1,72 @@
+/*
+ * gputemp.css — GPU Temperature plugin (gputemp) dashboard tile styles
+ *
+ * Scope: title, row layout and status text colors only. No background
+ * colors are hardcoded so the tile stays readable on all three official
+ * themes (gray / azure / white). Normal state reuses the official
+ * "green-text" class; Unraid WebGUI ships no official yellow/warning
+ * class, hence the two custom classes below.
+ */
+
+/* Tile title: the visible bold title is rendered by the tile content
+   itself (the tbody title attribute only feeds the Content Manager). */
+.gputemp-title-row .gputemp-title {
+  font-weight: bold;
+}
+
+/* Warning level: temperature >= TEMP_WARN and < TEMP_CRIT (yellow, custom) */
+.gputemp-row .warn-text {
+  color: #f0ad00;
+}
+
+/* Critical level: temperature >= TEMP_CRIT (red, custom) */
+.gputemp-row .crit-text {
+  color: #e22c2c;
+}
+
+/* Error placeholders (read timeout / driver missing) use the official red-text class as-is */
+
+/* Unified two-line row layout (identical DOM for every GPU):
+   line 1 = icon + name (left) and temperature (right),
+   line 2 = memory detail ("x.x / y.y GB" or "N/A", same style).
+   nowrap guarantees no card ever renders an extra wrapped sub-row. */
+.gputemp-row > td {
+  white-space: nowrap;
+}
+
+.gputemp-row .gputemp-line {
+  display: flex;
+  align-items: baseline;
+  gap: .5rem;
+}
+
+/* Keep the fixed-width framework spans (w18/w44) from collapsing in flex */
+.gputemp-row .gputemp-line > .w18,
+.gputemp-row .gputemp-line > .w44 {
+  flex-shrink: 0;
+}
+
+/* Temperature pinned to the right edge of the first line */
+.gputemp-row .gputemp-line-main .gputemp-temp {
+  margin-left: auto;
+}
+
+/* GPU name column: keep long model names inside the fixed-width span */
+.gputemp-row .gputemp-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Memory usage column ("x.x / y.y GB" or "N/A") — identical style for
+   real figures and the N/A placeholder (no data source) alike */
+.gputemp-row .gputemp-mem {
+  display: inline-block;
+  vertical-align: bottom;
+}
+
+/* Vendor-neutral icon alignment inside compact rows */
+.gputemp-row i.fa {
+  width: 1.25em;
+  text-align: center;
+}

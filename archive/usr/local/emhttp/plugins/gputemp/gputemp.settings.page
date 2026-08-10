@@ -1,0 +1,182 @@
+Menu="Utilities"
+Title="GPU Temperature"
+Icon="gputemp.png"
+---
+<?php
+/*
+ * gputemp.settings.page — plugin settings + installation status.
+ *
+ * Contract (SRS FR-3.10, FR-6.2, FR-6.4, SR-6.1, AC-UI-09):
+ *  - Dynamix markdown form; every field POSTs one of the six config keys
+ *    plus csrf_token to /plugins/gputemp/save.php (target="progressFrame").
+ *  - Configuration is read through gputemp_cfg() (helper.php) only.
+ *  - Detected GPU PCI addresses are shown next to ENABLED_GPUS as a
+ *    reference; detection unavailability degrades to a placeholder.
+ *  - "Purge configuration" is an explicit, irreversible POST action=purge.
+ *  - The installation status block falls back to a placeholder when the
+ *    plugin manifest cannot be parsed.
+ */
+
+require_once('/usr/local/emhttp/plugins/dynamix/include/Wrappers.php');
+global $var;
+
+$plugin  = 'gputemp';
+$plgPath = "/var/log/plugins/$plugin.plg";
+$helper  = __DIR__.'/include/helper.php';
+if (file_exists($helper)) require_once($helper);
+
+$cfg = function_exists('gputemp_cfg') ? gputemp_cfg() : parse_plugin_cfg($plugin);
+$stateDir = defined('GPUTEMP_STATE_DIR') ? GPUTEMP_STATE_DIR
+          : (defined('STATE_DIR') ? STATE_DIR : '/var/local/emhttp/plugins/gputemp');
+
+/* --- detected GPU list (reference for the whitelist field) -------------- */
+$detected = [];
+$cacheFile = $stateDir.'/devices.json';
+if (is_readable($cacheFile)) {
+  $cacheData = json_decode((string)@file_get_contents($cacheFile), true);
+  if (is_array($cacheData)) {
+    if (isset($cacheData['devices']) && is_array($cacheData['devices'])) $detected = $cacheData['devices'];
+    elseif (isset($cacheData['gpus']) && is_array($cacheData['gpus'])) $detected = $cacheData['gpus'];
+  }
+}
+if (empty($detected)) {
+  $detect = __DIR__.'/include/detect.php';
+  if (file_exists($detect)) {
+    require_once($detect);
+    foreach (['gputemp_get_devices','gputemp_detect_devices','gputemp_devices','gputemp_enumerate_gpus'] as $fn) {
+      if (function_exists($fn)) {
+        $list = @$fn();
+        if (is_array($list) && !empty($list)) { $detected = array_values($list); break; }
+      }
+    }
+  }
+}
+
+/* --- installation status (FR-3.10 / AC-UI-09) ---------------------------- */
+$installInfo = null;
+if (file_exists($plgPath)) {
+  $getAttr = function ($attr) use ($plgPath) {
+    $v = get_plugin_attr($attr, $plgPath);
+    return ($v === null || $v === false || $v === '') ? null : $v;
+  };
+  $infoVersion  = $getAttr('version');
+  $infoSource   = $getAttr('pluginURL');
+  $infoAuthor   = $getAttr('author');
+  if ($infoVersion !== null) {
+    $installInfo = [
+      'name'    => $plugin,
+      'version' => $infoVersion,
+      'author'  => $infoAuthor,
+      'source'  => ($infoSource !== null) ? $infoSource : _('Local install'),
+      'time'    => date('Y-m-d H:i:s', @filemtime($plgPath)),
+      'status'  => _('Installed'),
+    ];
+  }
+}
+
+$csrf = $var['csrf_token'] ?? '';
+?>
+
+<form markdown="1" method="POST" action="/plugins/gputemp/save.php" target="progressFrame" oninput="gputempFormChanged(this)">
+<input type="hidden" name="csrf_token" value="<?=$csrf?>">
+
+_(Refresh Interval)_:
+: <select name="REFRESH_INTERVAL">
+<?=mk_option($cfg['REFRESH_INTERVAL'], '1', _('1 second'))?>
+<?=mk_option($cfg['REFRESH_INTERVAL'], '2', _('2 seconds'))?>
+<?=mk_option($cfg['REFRESH_INTERVAL'], '5', _('5 seconds (recommended)'))?>
+<?=mk_option($cfg['REFRESH_INTERVAL'], '10', _('10 seconds'))?>
+</select>
+
+>_(The 1 second interval is only recommended for systems with a single NVIDIA discrete GPU. If a collection cycle takes longer than the interval, that cycle is automatically skipped.)_
+
+_(Warning Temperature)_:
+: <input type="number" name="TEMP_WARN" value="<?=$cfg['TEMP_WARN']?>" min="1" max="119" step="1"> ℃
+
+_(Critical Temperature)_:
+: <input type="number" name="TEMP_CRIT" value="<?=$cfg['TEMP_CRIT']?>" min="2" max="120" step="1"> ℃
+
+>_(The warning threshold must be lower than the critical threshold, and the critical threshold may not exceed 120.)_
+
+_(Enabled GPUs)_:
+: <input type="text" name="ENABLED_GPUS" value="<?=htmlspecialchars($cfg['ENABLED_GPUS'] ?? '', ENT_QUOTES)?>" placeholder="0000:01:00.0,0000:02:00.0">
+
+<?php
+$ref = [];
+foreach ($detected as $dev) {
+  if (!is_array($dev) || empty($dev['pci'])) continue;
+  $ref[] = htmlspecialchars($dev['pci'].(isset($dev['name']) ? ' — '.$dev['name'] : '').(isset($dev['vendor']) ? ' ('.$dev['vendor'].')' : ''), ENT_QUOTES);
+}
+if (!empty($ref)): ?>
+>_(Detected GPUs)_<br><?php echo implode('<br>', array_map(function ($l) { return '&nbsp;&nbsp;`'.$l.'`'; }, $ref)); ?>
+
+<?php else: ?>
+>_(No detected GPUs available for reference)_
+
+<?php endif; ?>
+
+>_(Comma separated PCI addresses. Leave empty to display every supported device.)_
+
+_(Collection Timeout)_:
+: <input type="number" name="COLLECT_TIMEOUT" value="<?=$cfg['COLLECT_TIMEOUT']?>" min="1" max="30" step="1">
+
+_(Failure Threshold)_:
+: <input type="number" name="FAIL_THRESHOLD" value="<?=$cfg['FAIL_THRESHOLD']?>" min="1" step="1">
+
+>_(After this many consecutive failed collections a GPU is removed from the collection targets and marked unavailable until reboot or next configuration save.)_
+
+: <input type="button" value="_(Default)_" onclick="gputempResetDefaults(this.form)">
+<input type="submit" id="gputemp-apply" name="#apply" value="_(Apply)_" disabled>
+<input type="button" value="_(Done)_" onclick="done()">
+</form>
+
+<?php if ($installInfo !== null): ?>
+<div class="title">_(Installation Status)_</div>
+<table class="gputemp-install-info">
+ <tr><td>_(Plugin Name)_:</td><td><?=htmlspecialchars($installInfo['name'], ENT_QUOTES)?></td></tr>
+ <tr><td>_(Version)_:</td><td><?=htmlspecialchars($installInfo['version'], ENT_QUOTES)?></td></tr>
+<?php if ($installInfo['author'] !== null): ?>
+ <tr><td>_(Author)_:</td><td><?=htmlspecialchars($installInfo['author'], ENT_QUOTES)?></td></tr>
+<?php endif; ?>
+ <tr><td>_(Source)_:</td><td><?=htmlspecialchars($installInfo['source'], ENT_QUOTES)?></td></tr>
+ <tr><td>_(Last Installed)_:</td><td><?=$installInfo['time']?></td></tr>
+ <tr><td>_(Status)_:</td><td><span class="green-text"><?=$installInfo['status']?></span></td></tr>
+</table>
+<?php else: ?>
+<div class="title">_(Installation Status)_</div>
+<p>_(Install info unavailable)_</p>
+<?php endif; ?>
+
+<div class="title">_(Danger Zone)_</div>
+<form markdown="1" method="POST" action="/plugins/gputemp/save.php" target="progressFrame" onsubmit="return confirm('_(This action is irreversible. All plugin settings will be permanently deleted. Continue?)_');">
+<input type="hidden" name="csrf_token" value="<?=$csrf?>">
+<input type="hidden" name="action" value="purge">
+
+_(Purge Configuration)_:
+: <input type="submit" class="red-text" value="_(Purge Configuration)_">
+
+>_(Irreversible: permanently deletes the plugin configuration from the flash drive.)_
+</form>
+
+<script>
+var gputempDefaults = {
+  REFRESH_INTERVAL: '5',
+  TEMP_WARN: '65',
+  TEMP_CRIT: '85',
+  ENABLED_GPUS: '',
+  COLLECT_TIMEOUT: '5',
+  FAIL_THRESHOLD: '3'
+};
+function gputempFormChanged(form) {
+  var btn = document.getElementById('gputemp-apply');
+  if (btn) btn.disabled = false;
+}
+function gputempResetDefaults(form) {
+  for (var key in gputempDefaults) {
+    var el = form.elements[key];
+    if (el) el.value = gputempDefaults[key];
+  }
+  var btn = document.getElementById('gputemp-apply');
+  if (btn) btn.disabled = false;
+}
+</script>

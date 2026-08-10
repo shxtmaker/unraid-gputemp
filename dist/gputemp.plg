@@ -1,0 +1,204 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "gputemp">
+<!ENTITY author    "gputemp-dev">
+<!ENTITY version   "2026.08.10">
+<!ENTITY launch    "Settings/gputemp.settings">
+<!ENTITY plgPATH   "/boot/config/plugins/&name;">
+<!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
+<!ENTITY plgNAME   "&name;-&version;-x86_64-1">
+<!--
+  Offline distribution (no public hosting):
+  - pkgURL uses the file:// protocol (fetched with wget, which supports
+    file:// natively) and points at the flash-drive location where the
+    user pre-stages the txz next to this .plg file.
+  - The primary install path never touches any URL: the official plugin
+    manager skips the download entirely when the Name target already
+    exists with a matching SHA256, then runs upgradepkg directly on it.
+  - pluginURL likewise points at the locally installed copy of this .plg,
+    so "check for updates" compares against local state instead of
+    failing on a dead host. Replace both entities with https:// URLs
+    once public hosting becomes available.
+-->
+<!ENTITY pluginURL "file://&plgPATH;/&name;.plg">
+<!ENTITY pkgURL    "file://&plgPATH;/&plgNAME;.txz">
+<!ENTITY sha256    "404e03d85a0d1f2d4e880903c093b21d087e616272aaad904b2229f64c8ff11c">
+]>
+
+<!--
+  gputemp — GPU temperature monitor for Unraid 7.2+.
+
+  Segment order (fixed by design):
+    1. pre-install bash : version gate re-check + temperature data source gate
+    2. FILE             : txz package download + SHA256 verify + install
+    3. post-install bash: mkdir plugin config dir, remove stale txz versions
+    4. remove bash      : removepkg + RAM disk cleanup ONLY.
+                          Zero deletion statements against /boot — the user
+                          configuration file is explicitly preserved on a
+                          standard uninstall (use the settings page "purge"
+                          action or an explicit manual deletion for a full
+                          cleanup).
+
+  Integrity: SHA256 only. No MD5 element anywhere in this manifest.
+-->
+
+<PLUGIN
+    name="&name;"
+    author="&author;"
+    version="&version;"
+    min="7.2.0-beta"
+    launch="&launch;"
+    pluginURL="&pluginURL;"
+    icon="thermometer-half"
+    support="https://forums.unraid.net/"
+>
+
+<Description>
+GPU temperature monitor for Unraid. Shows NVIDIA / AMD / Intel GPU temperatures
+and memory usage as a dashboard tile with configurable refresh
+interval (1 / 2 / 5 / 10 s), user-defined warning and critical thresholds, a
+per-device whitelist and request-driven collection with a shared cache. No
+daemon processes are started. Requires Unraid 7.2.0-beta or newer.
+</Description>
+
+<Support>https://forums.unraid.net/</Support>
+
+<CHANGES>
+###2026.08.10
+
+- Fix the missing tile title: on Unraid 7.2+ the tbody title attribute only
+  feeds the Content Manager window, so the bold "GPU温度" title is now
+  rendered by the tile content itself as the first row.
+- Unify both GPU rows into one identical two-line DOM structure: line 1
+  icon + model name (bold, same font size for every card) with the
+  temperature pinned to the right, line 2 the memory detail "x.x / y.y GB"
+  (or "N/A" in the exact same style when the card has no memory data
+  source, e.g. Intel Arc without an lmem sysfs node) — no more stray bold
+  N/A, missing detail line or mismatched font sizes between cards.
+
+###2026.08.09
+
+- Retitle the dashboard tile to "GPU温度" and unify every GPU row to
+  the same layout with a single vendor-neutral icon (no more per-vendor
+  icons or an extra utilization sub-row).
+- Drop GPU utilization collection entirely (radeontop / intel_gpu_top are
+  no longer used); add per-card memory usage display ("x.x / y.y GB")
+  sourced from nvidia-smi memory.used/memory.total, amdgpu
+  mem_info_vram_used/total sysfs nodes, and probed i915 lmem nodes
+  (N/A when the data source is absent, e.g. APUs).
+- JSON contract change: per-GPU fields are now
+  {pci, vendor, name, temp, mem_used, mem_total, status}; the util field
+  is removed and mem_used/mem_total are MiB integers or null.
+
+###2026.08.08
+
+- Widen the PCI class-code filter from [0300]/[0380] to the whole 0x03
+  prefix, so data-centre 3D controllers ([0302], e.g. NVIDIA Tesla P4)
+  are detected alongside VGA and Other display controllers.
+- Move the settings page into the Utilities menu.
+- Bump the package version: upgradepkg --install-new silently skips a
+  package whose name/version is already installed, so a version bump is
+  mandatory for any content fix to reach existing installations.
+- Initial release content (dashboard tile with anchor self-correcting
+  poller, settings page with install status and explicit configuration
+  purge action, standard uninstall preserves user configuration).
+</CHANGES>
+
+<!-- ======================================================================
+     1. PRE-INSTALL: version gate re-check + temperature data source gate.
+        Any failure aborts the installation with a non-zero exit code.
+     ====================================================================== -->
+<FILE Run="/bin/bash">
+<INLINE>
+UNRAID_VERSION="$(sed -n 's/^version=//p' /etc/unraid-version 2>/dev/null | head -n1 | tr -d '\"')"
+if [ -z "$UNRAID_VERSION" ]; then
+  echo "gputemp: unable to determine the Unraid version. Installation aborted."
+  exit 1
+fi
+case "$UNRAID_VERSION" in
+  # Reject 6.x, 7.0.x and every 7.1.x release. NB: '7.1.*' requires a
+  # literal dot right after "7.1", so 7.10/7.19/... are NOT swallowed.
+  6.*|7.0*|7.1|7.1-*|7.1.*)
+    echo "gputemp: Unraid $UNRAID_VERSION detected. This plugin requires Unraid 7.2.0-beta or newer. Installation aborted."
+    exit 1
+    ;;
+  7.[2-9]*|7.1[0-9]*)
+    echo "gputemp: Unraid $UNRAID_VERSION meets the 7.2.0-beta minimum. Continuing."
+    ;;
+  *)
+    echo "gputemp: Unraid $UNRAID_VERSION (newer than the known range). Assuming compatibility. Continuing."
+    ;;
+esac
+
+# Temperature data source gate: nvidia-smi (NVIDIA) or any hwmon temp1_input
+# node (AMD amdgpu / Intel i915 / Intel xe). Without any data source this
+# plugin has nothing to monitor, so installation is refused.
+if command -v nvidia-smi >/dev/null 2>&amp;1; then
+  echo "gputemp: nvidia-smi found. Temperature data source available."
+elif ls /sys/class/hwmon/hwmon*/temp1_input >/dev/null 2>&amp;1; then
+  echo "gputemp: hwmon temperature node found. Temperature data source available."
+else
+  echo "gputemp: no temperature data source found (neither nvidia-smi nor any hwmon temp1_input node). Installation aborted."
+  exit 1
+fi
+exit 0
+</INLINE>
+</FILE>
+
+<!-- ======================================================================
+     2. PACKAGE: SHA256-verify and install the txz package.
+        Offline semantics (verified against the official plugin manager
+        script, unraid/webgui dynamix.plugin.manager/scripts/plugin):
+        - If the user pre-stages the txz at the Name path below AND its
+          SHA256 matches &sha256;, the manager skips the fetch entirely
+          ("skipping: <file> already exists") and runs upgradepkg on it.
+        - Otherwise the URL is fetched with wget; file:// resolves to the
+          same flash-drive path, so a missing/corrupt pre-staged package
+          fails fast with a clear message instead of hitting the network.
+        &sha256; is filled in by build.ps1 at build time.
+     ====================================================================== -->
+<FILE Name="&plgPATH;/&plgNAME;.txz" Run="upgradepkg --install-new">
+<URL>&pkgURL;</URL>
+<SHA256>&sha256;</SHA256>
+</FILE>
+
+<!-- ======================================================================
+     3. POST-INSTALL: ensure the persistent config directory exists and
+        clean up stale txz packages from previous versions.
+     ====================================================================== -->
+<FILE Run="/bin/bash">
+<INLINE>
+mkdir -p &plgPATH;
+rm -f $(ls &plgPATH;/&name;-*.txz 2>/dev/null | grep -v '&version;')
+echo ""
+echo "----------------------------------------------------"
+echo " &name; &version; has been installed."
+echo "----------------------------------------------------"
+echo ""
+exit 0
+</INLINE>
+</FILE>
+
+<!-- ======================================================================
+     4. REMOVE (standard uninstall): removepkg + RAM disk cleanup ONLY.
+        By explicit design this section contains ZERO deletion statements
+        against /boot: /boot/config/plugins/gputemp/gputemp.cfg survives a
+        standard uninstall and is restored on reinstall.
+     ====================================================================== -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+removepkg &plgNAME;
+rm -rf &emhttp;
+echo ""
+echo "----------------------------------------------------"
+echo " &name; has been removed."
+echo " Your configuration was preserved. To remove it"
+echo " completely, delete the plugin folder on the flash"
+echo " drive manually."
+echo "----------------------------------------------------"
+echo ""
+exit 0
+</INLINE>
+</FILE>
+
+</PLUGIN>

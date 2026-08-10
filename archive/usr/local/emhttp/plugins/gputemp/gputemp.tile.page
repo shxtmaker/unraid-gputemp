@@ -1,0 +1,134 @@
+Menu="Dashboard:1"
+Icon="gputemp.png"
+Cond="version_compare(parse_ini_file('/etc/unraid-version')['version'],'7.2.0-beta','>=')"
+---
+<?php
+/*
+ * gputemp.tile.page — Dashboard tile for the gputemp plugin.
+ *
+ * Rendering contract (SRS UX-5.1/5.2/5.8, UR-4.1/4.2, PR-4.4):
+ *  - Single tile injected via $mytiles['gputemp']['column1'].
+ *  - Visible bold title: on Unraid 7.2+ the tbody title attribute is only
+ *    metadata for the Content Manager window (see the official
+ *    DashboardCustomTileExample page); the bold on-screen title must be
+ *    rendered by the tile content itself, so the first row of the tile
+ *    carries the "_(GPU温度)_" title text in a custom .gputemp-title span.
+ *  - First paint is a pure placeholder skeleton ("--℃" / "--"): no collection
+ *    is triggered during page render, data arrives via the JSON endpoint.
+ *  - Two compact rows per GPU with an identical DOM structure and class set
+ *    for every vendor (isomorphic rows): line 1 = FA icon (w18) + name
+ *    (w44, bold) left-aligned and temperature span right-aligned
+ *    (id gputemp-t-<pci>); line 2 = memory usage span "x.x / y.y GB" or
+ *    "N/A" in the exact same style when no data source exists
+ *    (id gputemp-m-<pci>).
+ */
+
+require_once('/usr/local/emhttp/plugins/dynamix/include/Wrappers.php');
+
+$plugin = 'gputemp';
+
+/* Configuration: helper.php is the single sanctioned read path; keep a
+   defensive fallback so the tile never breaks the dashboard. */
+$helper = __DIR__.'/include/helper.php';
+if (file_exists($helper)) require_once($helper);
+
+if (function_exists('gputemp_cfg')) {
+  $cfg = gputemp_cfg();
+} else {
+  $cfg = parse_plugin_cfg($plugin);
+}
+$refresh = in_array((string)($cfg['REFRESH_INTERVAL'] ?? '5'), ['1','2','5','10'], true) ? (int)$cfg['REFRESH_INTERVAL'] : 5;
+$warn    = ($cfg['TEMP_WARN'] ?? 65) !== '' ? (int)$cfg['TEMP_WARN'] : 65;
+$crit    = ($cfg['TEMP_CRIT'] ?? 85) !== '' ? (int)$cfg['TEMP_CRIT'] : 85;
+$collect = ($cfg['COLLECT_TIMEOUT'] ?? 5) !== '' ? max(1, min(30, (int)$cfg['COLLECT_TIMEOUT'])) : 5;
+$stateDir = defined('GPUTEMP_STATE_DIR') ? GPUTEMP_STATE_DIR
+          : (defined('STATE_DIR') ? STATE_DIR : '/var/local/emhttp/plugins/gputemp');
+
+/* GPU list for the skeleton rows. Source priority:
+   1) devices.json cache (written by the detection layer, no collection here);
+   2) the enumeration function of detect.php when present and cheap;
+   3) fallback -> "No GPU detected" placeholder row. */
+$devices = [];
+$cacheFile = $stateDir.'/devices.json';
+if (is_readable($cacheFile)) {
+  $cacheData = json_decode((string)@file_get_contents($cacheFile), true);
+  if (is_array($cacheData)) {
+    if (isset($cacheData['devices']) && is_array($cacheData['devices'])) $devices = $cacheData['devices'];
+    elseif (isset($cacheData['gpus']) && is_array($cacheData['gpus'])) $devices = $cacheData['gpus'];
+  }
+}
+if (empty($devices)) {
+  $detect = __DIR__.'/include/detect.php';
+  if (file_exists($detect)) {
+    require_once($detect);
+    foreach (['gputemp_get_devices','gputemp_detect_devices','gputemp_devices','gputemp_enumerate_gpus'] as $fn) {
+      if (function_exists($fn)) {
+        $list = @$fn();
+        if (is_array($list) && !empty($list)) { $devices = array_values($list); break; }
+      }
+    }
+  }
+}
+
+/* Unified icon for every GPU row (vendor-neutral, identical layout). */
+function gputemp_row_icon() {
+  return 'fa fa-microchip';
+}
+
+$rows = '';
+foreach ($devices as $gpu) {
+  if (!is_array($gpu) || empty($gpu['pci'])) continue;
+  $pci  = htmlspecialchars((string)$gpu['pci'], ENT_QUOTES);
+  $name = htmlspecialchars((string)($gpu['name'] ?? (isset($gpu['vendor']) ? $gpu['vendor'].' GPU' : _('GPU'))), ENT_QUOTES);
+  $icon = gputemp_row_icon();
+  /* Two-line row, identical DOM for every GPU: line 1 icon + bold name
+     (left) and temperature (right), line 2 memory detail (or N/A). */
+  $rows .= <<<ROW
+<tr class="gputemp-row" data-pci="$pci">
+ <td>
+  <div class="gputemp-line gputemp-line-main">
+   <span class="w18"><i class="$icon"></i></span>
+   <span class="w44 gputemp-name">$name</span>
+   <span class="gputemp-temp green-text" id="gputemp-t-$pci">--&#8451;</span>
+  </div>
+  <div class="gputemp-line gputemp-line-detail">
+   <span class="w18"></span>
+   <span class="gputemp-mem" id="gputemp-m-$pci">--</span>
+  </div>
+ </td>
+</tr>
+ROW;
+}
+if ($rows === '') {
+  $rows = '<tr><td><span>'._('No GPU detected').'</span></td></tr>';
+}
+
+/* Single tile, column1 only (SRS FR-3.6: columns are viewport breakpoints,
+   not per-GPU columns). The tbody title feeds the Content Manager window;
+   the visible bold title is the first content row (framework contract). */
+$mytiles[$plugin]['column1'] = <<<TILE
+<tbody id="gputemp-tile" title="_(GPU温度)_">
+<tr class="gputemp-title-row"><td><span class="gputemp-title">_(GPU温度)_</span></td></tr>
+$rows
+</tbody>
+TILE;
+
+/* Runtime config for the poller; user-visible strings pass through _(). */
+$gputempJsConfig = [
+  'refreshInterval' => $refresh,
+  'tempWarn'        => $warn,
+  'tempCrit'        => $crit,
+  'collectTimeout'  => $collect,
+  'endpoint'        => '/plugins/gputemp/api/gputemp.php',
+  'i18n'            => [
+    'readTimeout'   => _('Read timeout'),
+    'unavailable'   => _('Unavailable'),
+    'driverMissing' => _('Driver missing'),
+  ],
+];
+?>
+<link rel="stylesheet" href="<?autov('/plugins/gputemp/css/gputemp.css')?>">
+<script>
+window.GPUTEMP_CONFIG = <?=json_encode($gputempJsConfig, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);?>;
+</script>
+<script src="<?autov('/plugins/gputemp/js/gputemp.js')?>"></script>
